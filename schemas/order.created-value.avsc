@@ -5,7 +5,6 @@
   "x-topic": "production.order.created",
   "fields": [
     {"name": "orderId", "type": "string"},
-    {"name": "reservationId", "type": "string"},
     {"name": "totalYen", "type": "long"},
     {"name": "status", "type": "string"}
   ]
