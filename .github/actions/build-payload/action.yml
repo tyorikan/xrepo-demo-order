@@ -1,0 +1,83 @@
+# build-payload: composite action that packs one pull request for the xrepo Review API.
+#
+# Where it goes: your-org/xrepo-workflows/actions/build-payload/ (this file and
+# build_payload.py). review.yml calls it as your-org/xrepo-workflows/actions/build-payload@main
+# after actions/checkout fetched the pull request head with fetch-depth: 0.
+#
+# It needs python3 (3.9 or newer, standard library only) and git on the runner. GitHub-hosted
+# Ubuntu runners have both. It reads file contents from Git objects, never from the working
+# tree, and it never calls the network, except terraform get for Terraform roots with remote
+# modules (only when terraform is on the PATH).
+#
+# Files it writes (in output_dir):
+#   request.tar.gz  request.json, files/{base,head}/<path>, diff.patch (cut at 5 MiB), and
+#                   bundles/{openapi,events,knowledge}/{base,head}/<path>
+#   request.json    the same request.json, for the body of POST /v1/reviews/upload
+#   infra.tar.gz    infra/{base,head}/<path> for each changed Terraform root (only when one
+#                   changed). Terraform files never go into request.tar.gz.
+# Each archive stays at or under limits.max_archive_bytes from repo-config. Files that do not
+# fit, links, submodules, and secret-looking files are listed in skipped in request.json.
+name: xrepo build-payload
+description: Build request.tar.gz (and infra.tar.gz) for one pull request review.
+
+inputs:
+  config:
+    description: Path to the JSON from GET /v1/repo-config.
+    required: true
+  pr:
+    description: >-
+      Path to pr.json from the review workflow: number, base_sha, head_sha, base_ref, and body
+      (Depends-On lines).
+    required: true
+  force:
+    description: '"true" for /xrepo recheck. Sets force in request.json.'
+    required: false
+    default: "false"
+  output_dir:
+    description: Folder for the archives. Empty means $RUNNER_TEMP/xrepo/payload.
+    required: false
+    default: ""
+  repo_path:
+    description: Path of the checked-out repository.
+    required: false
+    default: ${{ github.workspace }}
+
+outputs:
+  request:
+    description: Path to request.tar.gz.
+    value: ${{ steps.build.outputs.request }}
+  request_json:
+    description: Path to request.json (the same file as in request.tar.gz).
+    value: ${{ steps.build.outputs.request_json }}
+  infra:
+    description: Path to infra.tar.gz, or empty when no Terraform root changed.
+    value: ${{ steps.build.outputs.infra }}
+  has_infra:
+    description: '"true" when infra.tar.gz was written, otherwise "false".'
+    value: ${{ steps.build.outputs.has_infra }}
+  request_id:
+    description: The request ID, {repo}#{pr}@{head_sha}.
+    value: ${{ steps.build.outputs.request_id }}
+  files:
+    description: Number of changed files in request.tar.gz (base and head count separately).
+    value: ${{ steps.build.outputs.files }}
+  skipped:
+    description: Number of entries in skipped in request.json.
+    value: ${{ steps.build.outputs.skipped }}
+
+runs:
+  using: composite
+  steps:
+    - id: build
+      name: Build the request archives
+      shell: bash
+      env:
+        XREPO_CONFIG: ${{ inputs.config }}
+        XREPO_PR: ${{ inputs.pr }}
+        XREPO_FORCE: ${{ inputs.force }}
+        XREPO_OUTPUT_DIR: ${{ inputs.output_dir }}
+        XREPO_REPO_PATH: ${{ inputs.repo_path }}
+        # The repository always comes from the run context, never from an input.
+        XREPO_REPOSITORY: ${{ github.repository }}
+      # -I: isolated mode, so PYTHON* variables and user site packages cannot change the script.
+      run: python3 -I "$GITHUB_ACTION_PATH/build_payload.py"

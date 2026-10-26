@@ -1,0 +1,21 @@
+openapi: 3.0.3
+info:
+  title: order-service
+  version: 1.0.0
+paths:
+  /v1/orders/{id}/confirm:
+    post:
+      operationId: confirmOrder
+      responses:
+        "200":
+          description: Confirmed order.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [orderId, totalYen]
+                properties:
+                  orderId:
+                    type: string
+                  totalYen:
+                    type: integer

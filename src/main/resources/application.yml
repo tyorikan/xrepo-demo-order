@@ -1,0 +1,9 @@
+server:
+  port: 8081
+spring:
+  kafka:
+    consumer:
+      group-id: order-service-group
+app:
+  kafka:
+    order-topic: production.order.created

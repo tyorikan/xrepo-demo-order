@@ -1,0 +1,342 @@
+name: xrepo
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+
+concurrency:
+  group: >-
+    xrepo-${{ github.workflow }}-${{
+      github.event.pull_request.number ||
+      github.ref
+    }}-${{ github.event.action == 'closed' && 'closed' || 'active' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && github.event.action != 'closed' }}
+
+permissions: {}
+
+jobs:
+  index:
+    if: >-
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - id: auth
+        name: Get an ID token (Workload Identity Federation)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.XREPO_WIF_PROVIDER }}
+          service_account: ${{ secrets.XREPO_INDEX_SA }}
+          token_format: id_token
+          id_token_audience: ${{ secrets.XREPO_INDEX_API_URL }}
+          id_token_include_email: true
+          create_credentials_file: false
+          export_environment_variables: false
+
+      - name: Read the repository settings (GET /v1/repo-config)
+        env:
+          API_URL: ${{ secrets.XREPO_INDEX_API_URL }}
+          ID_TOKEN: ${{ steps.auth.outputs.id_token }}
+          REPO: ${{ github.repository }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/xrepo"
+          curl -sS --fail --max-time 30 -G "$API_URL/v1/repo-config" \
+            --data-urlencode "repo=$REPO" -H "Authorization: Bearer $ID_TOKEN" \
+            -o "$RUNNER_TEMP/xrepo/config.json"
+
+      - name: Check out the commit
+        uses: actions/checkout@v4
+
+      - id: roots
+        name: Choose the Terraform roots to send
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, re, subprocess
+          work = pathlib.Path(os.environ["RUNNER_TEMP"], "xrepo")
+          config = json.loads((work / "config.json").read_text(encoding="utf-8"))
+          repo = pathlib.Path.cwd().resolve()
+          def relative(path):
+              path = path.resolve()
+              if path != repo and repo not in path.parents:
+                  return None
+              return path.relative_to(repo).as_posix()
+          selected = []
+          for root in config.get("infra_roots") or []:
+              path = relative(repo / root["path"])
+              if path is None:
+                  continue
+              var_files = []
+              for env in (root.get("environments") or {}).values():
+                  for name in env.get("var_files") or []:
+                      rel = relative(repo / path / name)
+                      if rel is not None:
+                          var_files.append(rel)
+              watched = sorted(set([path] + var_files))
+              selected.append({"path": path, "include": watched, "remote_modules": False})
+          (work / "roots.json").write_text(json.dumps(selected), encoding="utf-8")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"count={len(selected)}\n")
+              out.write("remote=false\n")
+          PY
+
+      - id: manifest
+        name: Build the manifest
+        env:
+          REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, subprocess
+          work = pathlib.Path(os.environ["RUNNER_TEMP"], "xrepo")
+          def git(*args):
+              return subprocess.run(["git", *args], capture_output=True, check=True).stdout
+          def under(path, folder):
+              return folder == "." or path == folder or path.startswith(folder + "/")
+          roots = json.loads((work / "roots.json").read_text(encoding="utf-8"))
+          folders = sorted({folder for root in roots for folder in root["include"]})
+          entries = []
+          infra_files = []
+          for item in git("ls-tree", "-r", "-z", "--full-tree", "HEAD").split(b"\0"):
+              if not item:
+                  continue
+              meta, raw = item.split(b"\t", 1)
+              mode, kind, blob_sha = meta.decode().split(" ")
+              if kind != "blob" or mode == "120000":
+                  continue
+              path = raw.decode("utf-8", "replace")
+              entries.append({"path": path, "blob_sha": blob_sha})
+              if any(under(path, folder) for folder in folders):
+                  infra_files.append(raw)
+          (work / "infra_files").write_bytes(b"".join(raw + b"\0" for raw in infra_files))
+          request = {
+              "repo": os.environ["REPO"],
+              "commit_sha": git("rev-parse", "HEAD").decode().strip(),
+              "commit_time": git("show", "-s", "--format=%cI", "HEAD").decode().strip(),
+              "trigger": "backfill" if os.environ["EVENT"] == "workflow_dispatch" else "push",
+              "manifest": entries,
+              "infra_roots": [root["path"] for root in roots],
+          }
+          (work / "manifest_request.json").write_text(json.dumps(request), encoding="utf-8")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"files={len(entries)}\n")
+          PY
+
+      - id: request
+        name: Send the manifest (POST /v1/index/manifest)
+        env:
+          API_URL: ${{ secrets.XREPO_INDEX_API_URL }}
+          ID_TOKEN: ${{ steps.auth.outputs.id_token }}
+        run: |
+          w="$RUNNER_TEMP/xrepo"
+          curl -sS --fail --max-time 120 -X POST "$API_URL/v1/index/manifest" \
+            -H "Authorization: Bearer $ID_TOKEN" -H "Content-Type: application/json" \
+            --data-binary @"$w/manifest_request.json" -o "$w/manifest_response.json"
+          index_id="$(jq -r '.index_id // empty' "$w/manifest_response.json")"
+          upload_url="$(jq -r '.upload_url // empty' "$w/manifest_response.json")"
+          if [ -n "$upload_url" ]; then echo "::add-mask::$upload_url"; fi
+          want="$(jq -r '(.want // []) | length' "$w/manifest_response.json")"
+          { echo "index_id=$index_id"; echo "want=$want"; } >> "$GITHUB_OUTPUT"
+
+      - name: Upload the wanted blobs and Terraform roots
+        if: steps.request.outputs.want != '0' || steps.roots.outputs.count != '0'
+        run: |
+          w="$RUNNER_TEMP/xrepo"
+          stage="$w/upload"
+          mkdir -p "$stage/blobs" "$stage/infra"
+          jq -r '.want[]?' "$w/manifest_response.json" | while IFS= read -r sha; do
+            git cat-file blob "$sha" > "$stage/blobs/$sha"
+          done
+          xargs -0 -r cp --parents -t "$stage/infra/" -- < "$w/infra_files"
+          tar -czf "$w/upload.tar.gz" -C "$stage" .
+          upload_url="$(jq -r '.upload_url' "$w/manifest_response.json")"
+          curl -sS --fail --max-time 900 -X PUT -H "Content-Type: application/gzip" \
+            --upload-file "$w/upload.tar.gz" "$upload_url"
+
+      - id: commit
+        name: Commit the snapshot (POST /v1/index/commit)
+        env:
+          API_URL: ${{ secrets.XREPO_INDEX_API_URL }}
+          ID_TOKEN: ${{ steps.auth.outputs.id_token }}
+          INDEX_ID: ${{ steps.request.outputs.index_id }}
+        run: |
+          w="$RUNNER_TEMP/xrepo"
+          jq -n --arg index_id "$INDEX_ID" '{index_id: $index_id}' > "$w/commit_request.json"
+          code="$(curl -sS --fail --max-time 600 -X POST "$API_URL/v1/index/commit" \
+            -H "Authorization: Bearer $ID_TOKEN" -H "Content-Type: application/json" \
+            --data-binary @"$w/commit_request.json" -o "$w/commit_response.json" \
+            -w '%{http_code}')"
+          cat "$w/commit_response.json"
+          echo "http_status=$code" >> "$GITHUB_OUTPUT"
+
+  review:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+      checks: write
+      pull-requests: write
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - id: auth
+        name: Get an ID token (Workload Identity Federation)
+        continue-on-error: true
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.XREPO_WIF_PROVIDER }}
+          service_account: ${{ secrets.XREPO_REVIEW_SA }}
+          token_format: id_token
+          id_token_audience: ${{ secrets.XREPO_REVIEW_API_URL }}
+          id_token_include_email: true
+          create_credentials_file: false
+          export_environment_variables: false
+
+      - id: pr
+        name: Read the pull request
+        continue-on-error: true
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          work="$RUNNER_TEMP/xrepo"
+          mkdir -p "$work"
+          fields='{number, state, html_url, body: (.body // ""), base_ref: .base.ref, base_sha: .base.sha, head_sha: .head.sha, head_repo: (.head.repo.full_name // "")}'
+          jq ".pull_request | $fields" "$GITHUB_EVENT_PATH" > "$work/pr.json"
+          number="$(jq -r '.number // empty' "$work/pr.json")"
+          head_sha="$(jq -r '.head_sha // empty' "$work/pr.json")"
+          state="$(jq -r '.state // empty' "$work/pr.json")"
+          open=false
+          if [ "$state" = open ]; then open=true; fi
+          {
+            echo "number=$number"
+            echo "head_sha=$head_sha"
+            echo "fork=false"
+            echo "open=$open"
+            if [ -n "$number" ]; then echo "request_id=$REPO#$number@$head_sha"; fi
+          } >> "$GITHUB_OUTPUT"
+
+      - id: config
+        name: Read the repository settings
+        continue-on-error: true
+        env:
+          API_URL: ${{ secrets.XREPO_REVIEW_API_URL }}
+          ID_TOKEN: ${{ steps.auth.outputs.id_token }}
+          REPO: ${{ github.repository }}
+          ACTION: ${{ github.event.action }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+        run: |
+          work="$RUNNER_TEMP/xrepo"
+          mkdir -p "$work"
+          mode=unavailable
+          infra=false
+          if [ -n "$ID_TOKEN" ] &&
+             curl -sS --fail --max-time 30 -G "$API_URL/v1/repo-config" \
+               --data-urlencode "repo=$REPO" -H "Authorization: Bearer $ID_TOKEN" \
+               -o "$work/config.json"; then
+            mode="$(jq -r '.mode // "unavailable"' "$work/config.json" || echo unavailable)"
+            infra="$(jq -r '((.infra_roots // []) | length) != 0' "$work/config.json" || echo false)"
+          fi
+          case "$ACTION:$mode" in
+            closed:*)      step=close ;;
+            *:off)         step=skip ;;
+            *:unavailable) step=unavailable ;;
+            *)             step=review ;;
+          esac
+          if [ "$step" = review ] && [ -z "$HEAD_SHA" ]; then step=unavailable; fi
+          { echo "mode=$mode"; echo "step=$step"; echo "infra=$infra"; } >> "$GITHUB_OUTPUT"
+
+      - id: checkout
+        name: Check out the pull request head
+        if: steps.config.outputs.step == 'review'
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.pr.outputs.head_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - id: payload
+        name: Build the request archives (request.tar.gz / infra.tar.gz)
+        if: steps.config.outputs.step == 'review' && steps.checkout.outcome == 'success'
+        continue-on-error: true
+        uses: ./.github/actions/build-payload
+        with:
+          config: ${{ runner.temp }}/xrepo/config.json
+          pr: ${{ runner.temp }}/xrepo/pr.json
+          force: "true"
+
+      - id: call
+        name: Upload archives to Cloud Storage and call POST /v1/reviews
+        if: steps.payload.outcome == 'success'
+        continue-on-error: true
+        env:
+          API_URL: ${{ secrets.XREPO_REVIEW_API_URL }}
+          ID_TOKEN: ${{ steps.auth.outputs.id_token }}
+          PAYLOAD: ${{ steps.payload.outputs.request }}
+          REQUEST_JSON: ${{ steps.payload.outputs.request_json }}
+          INFRA_PAYLOAD: ${{ steps.payload.outputs.infra }}
+          HAS_INFRA: ${{ steps.payload.outputs.has_infra }}
+          REQUEST_ID: ${{ steps.payload.outputs.request_id }}
+        run: |
+          w="$RUNNER_TEMP/xrepo"
+          result="$w/result.json"
+          jq -n --slurpfile req "$REQUEST_JSON" --argjson has_infra "${HAS_INFRA:-false}" \
+            '{request: $req[0], has_infra: $has_infra}' > "$w/upload_req.json"
+          if ! curl -sS --fail --max-time 60 -X POST "$API_URL/v1/reviews/upload" \
+               -H "Authorization: Bearer $ID_TOKEN" -H "Content-Type: application/json" \
+               --data-binary @"$w/upload_req.json" -o "$w/upload_resp.json"; then
+            echo '{"status":"unavailable"}' > "$result"
+            exit 0
+          fi
+          up_status="$(jq -r '.status // empty' "$w/upload_resp.json")"
+          if [ "$up_status" = "done" ]; then
+            jq '.result' "$w/upload_resp.json" > "$result"
+            exit 0
+          fi
+          arch_url="$(jq -r '.archive.url // empty' "$w/upload_resp.json")"
+          if [ -n "$arch_url" ]; then
+            echo "::add-mask::$arch_url"
+            curl -sS --fail --max-time 300 -X PUT -H "Content-Type: application/gzip" \
+              --upload-file "$PAYLOAD" "$arch_url"
+          fi
+          if [ "$HAS_INFRA" = "true" ] && [ -s "$INFRA_PAYLOAD" ]; then
+            infra_url="$(jq -r '.infra.url // empty' "$w/upload_resp.json")"
+            if [ -n "$infra_url" ]; then
+              echo "::add-mask::$infra_url"
+              curl -sS --fail --max-time 300 -X PUT -H "Content-Type: application/gzip" \
+                --upload-file "$INFRA_PAYLOAD" "$infra_url"
+            fi
+          fi
+          jq -n --arg request_id "$REQUEST_ID" '{request_id: $request_id, force: true}' > "$w/start_req.json"
+          if ! curl -sS --fail --max-time 840 -X POST "$API_URL/v1/reviews" \
+               -H "Authorization: Bearer $ID_TOKEN" -H "Content-Type: application/json" \
+               --data-binary @"$w/start_req.json" -o "$result"; then
+            echo '{"status":"unavailable"}' > "$result"
+          fi
+
+      - id: post
+        name: Post the check result and the PR comment
+        if: always() && !contains(fromJSON('["skip","close"]'), steps.config.outputs.step)
+        continue-on-error: true
+        uses: ./.github/actions/post-results
+        with:
+          result: ${{ runner.temp }}/xrepo/result.json
+          mode: ${{ steps.config.outputs.mode }}
+          step: ${{ steps.config.outputs.step }}
+          head_sha: ${{ steps.pr.outputs.head_sha || github.event.pull_request.head.sha }}
+          pr_number: ${{ steps.pr.outputs.number || github.event.pull_request.number }}

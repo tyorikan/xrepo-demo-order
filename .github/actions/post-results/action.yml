@@ -1,0 +1,75 @@
+# post-results: composite action that posts the xrepo-review check run and the PR comment.
+#
+# Where it goes: your-org/xrepo-workflows/actions/post-results/ (this file and post_results.py).
+# review.yml calls it as your-org/xrepo-workflows/actions/post-results@main. It needs python3
+# (3.9 or newer, standard library only) on the runner, and the job needs the GITHUB_TOKEN
+# permissions checks: write and pull-requests: write.
+#
+# Behavior:
+#   shadow (or off)  writes the job summary only. Nothing is posted to the pull request.
+#   other modes      step queue: check run `xrepo-review` with success, no comment.
+#                    step unavailable, or no usable result.json: neutral check run
+#                    "Review unavailable".
+#                    step review: creates the check run first (check_run_id is set at once),
+#                    then completes it with the conclusion, title, summary, text, and at most
+#                    50 annotations (highest severity first), and creates or updates the one
+#                    PR comment that contains <!-- xrepo-review -->.
+#   failure is posted only in mode required. Requests are retried on 5xx responses, network
+#   errors, and rate limits.
+# GitHub Checks API limits: at most 50 annotations per request (each update appends),
+# output.summary and output.text at most 65535 characters each, annotation title at most 255
+# characters, annotation message at most 64 KB. Reference: https://docs.github.com/en/rest/checks/runs
+name: xrepo post-results
+description: Post the xrepo-review check run, the pull request comment, and the job summary.
+
+inputs:
+  result:
+    description: Path to result.json from the Review API. A missing file means unavailable.
+    required: false
+    default: ""
+  mode:
+    description: off, shadow, advisory, or required. Anything else posts a neutral check.
+    required: false
+    default: ""
+  step:
+    description: review, queue, or unavailable. Empty also means unavailable.
+    required: false
+    default: ""
+  head_sha:
+    description: Commit that receives the check run.
+    required: true
+  pr_number:
+    description: Pull request that receives the comment. Empty for merge_group.
+    required: false
+    default: ""
+  token:
+    description: GitHub token with checks write and pull-requests write.
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  check_run_id:
+    description: ID of the check run, set as soon as it exists. Empty in shadow mode.
+    value: ${{ steps.post.outputs.check_run_id }}
+  conclusion:
+    description: Conclusion of the completed check run. Empty when it was not completed.
+    value: ${{ steps.post.outputs.conclusion }}
+  comment_id:
+    description: ID of the pull request comment, when one was created or updated.
+    value: ${{ steps.post.outputs.comment_id }}
+
+runs:
+  using: composite
+  steps:
+    - id: post
+      name: Post the check result and the PR comment
+      shell: bash
+      env:
+        XREPO_RESULT: ${{ inputs.result }}
+        XREPO_MODE: ${{ inputs.mode }}
+        XREPO_STEP: ${{ inputs.step }}
+        XREPO_HEAD_SHA: ${{ inputs.head_sha }}
+        XREPO_PR_NUMBER: ${{ inputs.pr_number }}
+        GITHUB_TOKEN: ${{ inputs.token }}
+      # -I: isolated mode, so PYTHON* variables and user site packages cannot change the script.
+      run: python3 -I "$GITHUB_ACTION_PATH/post_results.py"
