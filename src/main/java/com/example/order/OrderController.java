@@ -37,7 +37,7 @@ public class OrderController {
         for (CatalogOfferDto offer : catalog.getItems()) {
             totalYen += (long) offer.getPrice();
         }
-        OrderCreatedEvent evt = new OrderCreatedEvent(id, "res-" + id, totalYen, "CREATED");
+        OrderCreatedEvent evt = new OrderCreatedEvent(id, totalYen, "CREATED");
         kafkaTemplate.send("${app.kafka.order-topic}", id, evt);
         return ResponseEntity.ok(new OrderResponse(id, totalYen));
     }
@@ -50,9 +50,8 @@ public class OrderController {
     @KafkaListener(topics = "${app.kafka.order-topic}")
     public void onOrderCreatedAudit(OrderCreatedEvent event) {
         try {
-            String reservationId = event.getReservationId();
             long totalYen = event.getTotalYen();
-            if (reservationId.isEmpty() || totalYen < 0) {
+            if (totalYen < 0) {
                 throw new IllegalStateException("Invalid order event");
             }
         } catch (Exception ex) {
@@ -90,19 +89,15 @@ class OrderResponse {
 class OrderCreatedEvent {
     @NotNull
     private String orderId;
-    @NotNull
-    private String reservationId;
     private long totalYen;
     private String status;
 
-    public OrderCreatedEvent(String orderId, String reservationId, long totalYen, String status) {
+    public OrderCreatedEvent(String orderId, long totalYen, String status) {
         this.orderId = orderId;
-        this.reservationId = reservationId;
         this.totalYen = totalYen;
         this.status = status;
     }
 
-    public String getReservationId() { return reservationId; }
     public long getTotalYen() { return totalYen; }
     public String getStatus() { return status; }
 }
